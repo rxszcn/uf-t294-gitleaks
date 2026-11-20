@@ -260,7 +260,8 @@ title = "Custom Gitleaks configuration"
 #    together multiple configuration files to a depth of 2. Allowlist arrays are
 #    appended and can contain duplicates.
 
-# useDefault and path can NOT be used at the same time. Choose one.
+# useDefault, path, and url are mutually exclusive. Declare exactly one of them.
+# Declaring more than one is a load error, not a silent precedence rule.
 [extend]
 # useDefault will extend the default gitleaks config built in to the binary
 # the latest version is located at:
@@ -270,6 +271,28 @@ useDefault = true
 # The path is relative to where gitleaks was invoked,
 # not the location of the base config.
 # path = "common_config.toml"
+# or you can point at a remotely hosted ruleset, such as the centralized
+# credential-detection rule library published by the security rule platform.
+# Only http/https URLs are accepted. The fetched TOML is parsed and validated by
+# exactly the same pipeline as a local extended config: rule validation, allowlist
+# parsing, and the same depth-2 limit on chained extends all apply to it.
+# A thin config can therefore declare the remote library and keep only its own
+# local rule, e.g.:
+#
+#   [extend]
+#   url = "https://rules.internal.example/gitleaks/credential-rules.toml"
+#
+#   [[rules]]
+#   id = "my-local-rule"
+#   regex = '''...'''
+#
+# Fetch failures are surfaced as config load errors. That includes an unreachable
+# host, a non-2xx response, an empty body, malformed TOML, and a remote ruleset
+# that fails rule validation. The loader never falls back to a partial ruleset
+# silently, so a change in the assembled ruleset is always observable by the
+# caller. The remote ruleset is merged in with the same semantics as |path|:
+# duplicate rule IDs from the local config override the remote attributes, and
+# new remote rule IDs are appended.
 # If there are any rules you don't want to inherit, they can be specified here.
 disabledRules = [ "generic-api-key"]
 

@@ -1,11 +1,16 @@
 package config
 
 import (
+	"bytes"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	neturl "net/url"
 	"sort"
 	"strings"
+	"time"
 
 	gv "github.com/hashicorp/go-version"
 	"github.com/spf13/viper"
@@ -22,9 +27,20 @@ var (
 	// use to keep track of how many configs we can extend
 	// yea I know, globals bad
 	extendDepth int
+
+	// extendHTTPClient is used to fetch configs declared through `extend.url`.
+	// It is a package variable so tests can swap in a client pointed at a local
+	// managed rule library without touching the network.
+	extendHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
-const maxExtendDepth = 2
+const (
+	maxExtendDepth = 2
+	// maxExtendConfigBytes caps how much data we are willing to read from a
+	// remote rule library. It protects the process from a runaway response
+	// while still being far larger than any realistic ruleset.
+	maxExtendConfigBytes = 10 << 20
+)
 
 // ViperConfig is the config struct used by the Viper config package
 // to parse the config file. This struct does not include regular expressions.
@@ -104,6 +120,51 @@ type Extend struct {
 	URL           string
 	UseDefault    bool
 	DisabledRules []string
+}
+
+// extendChannel identifies which individual source a config is extended from.
+type extendChannel int
+
+const (
+	// extendChannelNone means the config does not extend anything.
+	extendChannelNone extendChannel = iota
+	// extendChannelDefault means the built-in default ruleset is used.
+	extendChannelDefault
+	// extendChannelPath means a local file path is used.
+	extendChannelPath
+	// extendChannelURL means a remote ruleset served by the managed registry is used.
+	extendChannelURL
+)
+
+// resolveExtendChannel picks the single extension channel declared by the
+// config. The three channels are mutually exclusive: declaring more than one is
+// ambiguous and rejected, so callers never have to guess which source won.
+func (c *Config) resolveExtendChannel() (extendChannel, error) {
+	var (
+		channel   = extendChannelNone
+		declared  []string
+		setIfOnce = func(name string, set bool, ch extendChannel) {
+			if !set {
+				return
+			}
+			declared = append(declared, name)
+			channel = ch
+		}
+	)
+	setIfOnce("extend.useDefault", c.Extend.UseDefault, extendChannelDefault)
+	setIfOnce("extend.path", c.Extend.Path != "", extendChannelPath)
+	setIfOnce("extend.url", c.Extend.URL != "", extendChannelURL)
+
+	switch len(declared) {
+	case 0:
+		return extendChannelNone, nil
+	case 1:
+		return channel, nil
+	default:
+		return extendChannelNone, fmt.Errorf(
+			"unable to load config due to %s being set together; extension channels are mutually exclusive, declare only one",
+			strings.Join(declared, " and "))
+	}
 }
 
 func (vc *ViperConfig) Translate() (Config, error) {
@@ -243,16 +304,23 @@ func (vc *ViperConfig) Translate() (Config, error) {
 
 	currentExtendDepth := extendDepth
 	if maxExtendDepth != currentExtendDepth {
-		// disallow both usedefault and path from being set
-		if c.Extend.Path != "" && c.Extend.UseDefault {
-			return Config{}, errors.New("unable to load config due to extend.path and extend.useDefault being set")
+		// Extension channels are mutually exclusive. Reject ambiguous
+		// combinations instead of silently picking one.
+		channel, err := c.resolveExtendChannel()
+		if err != nil {
+			return Config{}, err
 		}
-		if c.Extend.UseDefault {
+		switch channel {
+		case extendChannelDefault:
 			if err := c.extendDefault(vc); err != nil {
 				return Config{}, err
 			}
-		} else if c.Extend.Path != "" {
+		case extendChannelPath:
 			if err := c.extendPath(vc); err != nil {
+				return Config{}, err
+			}
+		case extendChannelURL:
+			if err := c.extendURL(vc); err != nil {
 				return Config{}, err
 			}
 		}
@@ -413,16 +481,75 @@ func (c *Config) extendPath(parent *ViperConfig) error {
 	return nil
 }
 
-func (c *Config) extendURL() {
-	// TODO
+func (c *Config) extendURL(parent *ViperConfig) error {
+	u, err := neturl.Parse(c.Extend.URL)
+	if err != nil {
+		return fmt.Errorf("invalid extend.url '%s': %w", c.Extend.URL, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("invalid extend.url '%s': scheme must be http or https", c.Extend.URL)
+	}
+
+	logging.Debug().Msgf("extending config with %s", c.Extend.URL)
+	resp, err := extendHTTPClient.Get(c.Extend.URL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch extended config from %s, err: %w", c.Extend.URL, err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("failed to fetch extended config from %s, err: unexpected HTTP status %s", c.Extend.URL, resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxExtendConfigBytes+1))
+	if err != nil {
+		return fmt.Errorf("failed to read extended config from %s, err: %w", c.Extend.URL, err)
+	}
+	if len(body) > maxExtendConfigBytes {
+		return fmt.Errorf("failed to read extended config from %s, err: response exceeds %d bytes", c.Extend.URL, maxExtendConfigBytes)
+	}
+	// An empty ruleset would leave the caller with only its local rules while
+	// reporting success, which is exactly the silent gap this channel exists to
+	// prevent. Treat it as invalid remote content instead.
+	if len(bytes.TrimSpace(body)) == 0 {
+		return fmt.Errorf("failed to load extended config from %s, err: response body is empty", c.Extend.URL)
+	}
+
+	// Remote content goes through the exact same path as a local extended
+	// config: TOML parsing, ViperConfig unmarshalling, Translate (including its
+	// nested extend handling and depth limit), and rule validation.
+	extendDepth++
+	viper.SetConfigType("toml")
+	if err := viper.ReadConfig(bytes.NewReader(body)); err != nil {
+		return fmt.Errorf("failed to load extended config from %s, err: %w", c.Extend.URL, err)
+	}
+	extensionViperConfig := ViperConfig{}
+	if err := viper.Unmarshal(&extensionViperConfig); err != nil {
+		return fmt.Errorf("failed to load extended config from %s, err: %w", c.Extend.URL, err)
+	}
+
+	extensionViperConfig.configPath = c.Extend.URL
+	cfg, err := extensionViperConfig.Translate()
+	if err != nil {
+		return fmt.Errorf("failed to load extended config from %s, err: %w", c.Extend.URL, err)
+	}
+	c.extend(cfg)
+	return nil
 }
 
 func (c *Config) extend(extensionConfig Config) {
 	// Get config name for helpful log messages.
 	var configName string
-	if c.Extend.Path != "" {
+	switch {
+	case c.Extend.Path != "":
 		configName = c.Extend.Path
-	} else {
+	case c.Extend.URL != "":
+		configName = c.Extend.URL
+	default:
 		configName = "default"
 	}
 	// Convert |Config.DisabledRules| into a map for ease of access.
